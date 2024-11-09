@@ -1,10 +1,16 @@
+use memory_protection_region::MemoryRegionProtection;
+use memory_region::MemoryRegion;
 use windows::Win32::{
     Foundation::{HANDLE, HMODULE, MAX_PATH},
     System::{
+        Memory::{VirtualQueryEx, MEMORY_BASIC_INFORMATION, MEM_COMMIT},
         ProcessStatus::{K32EnumProcessModules, K32EnumProcesses, K32GetModuleBaseNameA},
         Threading::{OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_VM_READ},
     },
 };
+
+mod memory_protection_region;
+mod memory_region;
 
 /// Represents a Windows process with its associated handle and information.
 ///
@@ -83,9 +89,9 @@ impl Process {
     /// }
     /// ```
     pub fn name(&self) -> String {
+        let mut module = Default::default();
+        let mut bytes_needed = 0;
         unsafe {
-            let mut module = std::mem::zeroed();
-            let mut bytes_needed = 0;
             // API wants an array, but we only make one "module"'s worth of space and give it that.
             if !K32EnumProcessModules(
                 self.handle,
@@ -108,6 +114,35 @@ impl Process {
             let name = buffer[..chars_written as usize].to_vec();
             String::from_utf8(name).unwrap()
         }
+    }
+
+    pub fn memory_regions(&self) -> Vec<MemoryRegion> {
+        let mut regions = Vec::new();
+        let mut mem_info = Default::default();
+        let mut addr = std::ptr::null_mut();
+        unsafe {
+            while VirtualQueryEx(
+                self.handle,
+                Some(addr),
+                &mut mem_info,
+                size_of::<MEMORY_BASIC_INFORMATION>(),
+            ) != 0
+            {
+                if mem_info.State == MEM_COMMIT {
+                    let r = MemoryRegion::new(
+                        mem_info.BaseAddress,
+                        mem_info.RegionSize,
+                        mem_info.Protect.into(),
+                    );
+                    regions.push(r);
+                    println!("{:p} {} {}", r.address(), r.size(), r.protection())
+                }
+
+                addr = addr.wrapping_add(mem_info.RegionSize);
+            }
+        }
+
+        regions
     }
 }
 
