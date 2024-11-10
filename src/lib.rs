@@ -1,15 +1,18 @@
+use std::ffi::c_void;
+
 use memory_protection_region::MemoryRegionProtection;
 use memory_region::MemoryRegion;
 use windows::Win32::{
     Foundation::{HANDLE, HMODULE, MAX_PATH},
     System::{
+        Diagnostics::Debug::{ReadProcessMemory, WriteProcessMemory},
         Memory::{VirtualQueryEx, MEMORY_BASIC_INFORMATION, MEM_COMMIT},
         ProcessStatus::{K32EnumProcessModules, K32EnumProcesses, K32GetModuleBaseNameA},
-        Threading::{OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_VM_READ},
+        Threading::{OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_VM_READ, PROCESS_VM_WRITE},
     },
 };
 
-mod memory_protection_region;
+pub mod memory_protection_region;
 mod memory_region;
 
 /// Represents a Windows process with its associated handle and information.
@@ -55,8 +58,13 @@ impl Process {
             return None;
         }
 
-        let handle =
-            unsafe { OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, false, pid) };
+        let handle = unsafe {
+            OpenProcess(
+                PROCESS_QUERY_INFORMATION | PROCESS_VM_READ | PROCESS_VM_WRITE,
+                false,
+                pid,
+            )
+        };
 
         match handle {
             Ok(handle) => Some(Self {
@@ -116,6 +124,25 @@ impl Process {
         }
     }
 
+    /// Returns a list of memory regions in the process's address space.
+    ///
+    /// This method queries the process memory using VirtualQueryEx to get information
+    /// about all memory regions. Only committed memory regions are included.
+    ///
+    /// # Returns
+    ///
+    /// A vector of MemoryRegion instances representing committed memory regions
+    /// in the process's address space.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// if let Some(process) = Process::new(1234) {
+    ///     for region in process.memory_regions() {
+    ///         println!("Region at {:p} with size {}", region.address(), region.size());
+    ///     }
+    /// }
+    /// ```
     pub fn memory_regions(&self) -> Vec<MemoryRegion> {
         let mut regions = Vec::new();
         let mut mem_info = Default::default();
@@ -143,6 +170,94 @@ impl Process {
         }
 
         regions
+    }
+
+    /// Reads memory from the specified region in the process's address space.
+    ///
+    /// # Arguments
+    ///
+    /// * `region` - The MemoryRegion to read from
+    ///
+    /// # Returns
+    ///
+    /// A vector containing the bytes read from the specified memory region.
+    /// The vector's length will match the number of bytes actually read.
+    ///
+    /// # Panics
+    ///
+    /// Panics if ReadProcessMemory fails.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// if let Some(process) = Process::new(1234) {
+    ///     let regions = process.memory_regions();
+    ///     if let Some(region) = regions.first() {
+    ///         let memory = process.read(region);
+    ///         println!("Read {} bytes from region", memory.len());
+    ///     }
+    /// }
+    /// ```
+    pub fn read(&self, region: &MemoryRegion) -> Vec<u8> {
+        let mut mem = Vec::with_capacity(region.size());
+
+        let mut bytes_read = 0;
+        unsafe {
+            if ReadProcessMemory(
+                self.handle,
+                region.address().as_ptr() as *mut c_void,
+                mem.as_mut_ptr() as *mut c_void,
+                mem.capacity(),
+                Some(&mut bytes_read),
+            )
+            .is_err()
+            {
+                panic!("Failed to read memory region.");
+            }
+            mem.set_len(bytes_read);
+        }
+
+        mem
+    }
+
+    /// Writes data to the specified region in the process's address space.
+    ///
+    /// # Arguments
+    ///
+    /// * `region` - The MemoryRegion to write to
+    /// * `data` - The bytes to write to the region
+    ///
+    /// # Panics
+    ///
+    /// * Panics if the data length exceeds the region size
+    /// * Panics if WriteProcessMemory fails
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// if let Some(process) = Process::new(1234) {
+    ///     let regions = process.memory_regions();
+    ///     if let Some(region) = regions.first() {
+    ///         let data = vec![0u8; 4];
+    ///         process.write(*region, &data);
+    ///     }
+    /// }
+    /// ```
+    pub fn write(&self, region: MemoryRegion, data: &[u8]) {
+        assert!(data.len() <= region.size()); // TODO(aalhendi): manage footgun
+        unsafe {
+            if WriteProcessMemory(
+                self.handle,
+                region.address().as_ptr() as *mut c_void,
+                data.as_ptr() as *const c_void,
+                data.len(),
+                None,
+            )
+            .is_err()
+            {
+                panic!("Failed to write memory region.")
+            }
+        }
     }
 }
 
@@ -227,4 +342,135 @@ pub fn find_process(name: &str) -> Vec<Process> {
     }
 
     procs
+}
+
+/// Searches for and replaces a pattern of bytes in a process's memory region.
+///
+/// # Arguments
+///
+/// * `process` - The process to modify memory in
+/// * `region` - The memory region to search through
+/// * `find` - The byte pattern to search for
+/// * `replace` - The bytes to replace matches with
+/// * `num_occurrences` - Optional limit on number of replacements to make. If None, replaces all occurrences
+///
+/// # Returns
+///
+/// * `Ok(usize)` - The number of replacements made
+/// * `Err(std::io::Error)` - If memory read/write operations fail
+///
+/// # Examples
+///
+/// ```rust
+/// let process = Process::new(1234).unwrap();
+/// let region = process.memory_regions()[0];
+///
+/// // Replace first occurrence of "Hello" with "World"
+/// let matches = replace_memory(
+///     &process,
+///     &region,
+///     b"Hello",
+///     b"World",
+///     Some(1)
+/// ).unwrap();
+/// println!("Made {} replacements", matches);
+/// ```
+pub fn replace_memory(
+    process: &Process,
+    region: &MemoryRegion,
+    find: &[u8],
+    replace: &[u8],
+    num_occurrences: Option<usize>,
+) -> Result<usize, std::io::Error> {
+    let memory = process.read(region);
+
+    let mut matches = 0;
+    let max_matches = num_occurrences.unwrap_or(usize::MAX);
+    let search_range = 0..memory.len().saturating_sub(find.len());
+
+    for i in search_range {
+        if matches >= max_matches {
+            break;
+        }
+
+        if memory[i..].starts_with(find) {
+            process.write(
+                MemoryRegion::new(
+                    (region.address().as_ptr() as usize + i) as *mut c_void,
+                    replace.len(),
+                    region.protection(),
+                ),
+                replace,
+            );
+            matches += 1;
+        }
+    }
+
+    Ok(matches)
+}
+
+/// Generic version of replace_memory that works with any Copy type.
+///
+/// Converts the input slices to byte arrays and calls the base replace_memory function.
+/// Useful for replacing patterns of integers, wide strings, or other fixed-size types.
+///
+/// # Type Parameters
+///
+/// * `T` - Any type that implements Copy
+///
+/// # Arguments
+///
+/// * `process` - The process to modify memory in
+/// * `region` - The memory region to search through
+/// * `find` - The pattern to search for as a slice of T
+/// * `replace` - The replacement pattern as a slice of T
+/// * `num_occurrences` - Optional limit on number of replacements to make
+///
+/// # Returns
+///
+/// * `Ok(usize)` - The number of replacements made
+/// * `Err(std::io::Error)` - If memory read/write operations fail
+///
+/// # Safety
+///
+/// Uses unsafe code to convert typed slices to byte slices. The conversion assumes
+/// the memory layout of T is contiguous with no padding.
+///
+/// # Examples
+///
+/// ```rust
+/// let process = Process::new(1234).unwrap();
+/// let region = process.memory_regions()[0];
+///
+/// // Replace wide string using u16 slice
+/// let find: Vec<u16> = "Hello".encode_utf16().collect();
+/// let replace: Vec<u16> = "World".encode_utf16().collect();
+///
+/// let matches = replace_memory_generic(
+///     &process,
+///     &region,
+///     &find,
+///     &replace,
+///     Some(1)
+/// ).unwrap();
+/// ```
+pub fn replace_memory_generic<T: Copy>(
+    process: &Process,
+    region: &MemoryRegion,
+    find: &[T],
+    replace: &[T],
+    num_occurrences: Option<usize>,
+) -> Result<usize, std::io::Error> {
+    let find_bytes = unsafe {
+        std::slice::from_raw_parts(find.as_ptr() as *const u8, std::mem::size_of_val(find))
+    };
+
+    let replace_bytes = unsafe {
+        std::slice::from_raw_parts(
+            replace.as_ptr() as *const u8,
+            std::mem::size_of_val(replace),
+        )
+    };
+
+    replace_memory(process, region, find_bytes, replace_bytes, num_occurrences)
 }
