@@ -3,6 +3,9 @@ name = "prochack"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.82.0"
+license = "BSL-1.0"
+authors = ["Abdulrazzaq Alhendi <dev@aalhendi.com>"]
+description = "A Rust port of blind_io by Nathan Baggs"
 
 [lib]
 name = "prochack"
@@ -22,5 +25,5 @@ features = [
     "Win32_System_Threading",
     "Win32_System_ProcessStatus",
     "Win32_System_Memory",
-    "Win32_System_Diagnostics_Debug"
+    "Win32_System_Diagnostics_Debug",
 ]
